@@ -1,0 +1,16 @@
+# Build output - the app is published on the Releases page, never committed
+dist/
+build/
+*.spec
+__pycache__/
+
+# Never commit URL lists or results - they belong to clients
+*.xlsx
+*.xlsm
+*.xls
+*.csv
+*.txt
+!requirements.txt
+*.jpg
+*.jpeg
+*.png

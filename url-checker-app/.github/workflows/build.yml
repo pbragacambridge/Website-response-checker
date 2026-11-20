@@ -1,0 +1,37 @@
+# Every push to main builds the app on a Windows machine at GitHub and puts it on the Releases page,
+# so it can be downloaded from: https://github.com/<you>/<repo>/releases/latest/download/URL-Checker.exe
+name: Build app
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install
+        run: python -m pip install -r requirements.txt pyinstaller==6.22.3
+
+      - name: Build
+        run: python build.py dist
+
+      - name: Publish to the Releases page
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest dist/URL-Checker.exe dist/URL-Checker.zip \
+            --title "URL Checker" --target "$GITHUB_SHA" \
+            --notes "Download **URL-Checker.exe** and double-click it. If your computer won't run it, download **URL-Checker.zip** instead, unzip it, and run URL-Checker.exe from the folder. Needs Google Chrome or Microsoft Edge. Built from ${GITHUB_SHA::7}."

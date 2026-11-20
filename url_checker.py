@@ -6,6 +6,7 @@ Usage:  python url_checker.py "list.xlsx"      (.xlsx, .csv or .txt)
 Saves "<file name> - results.xlsx" next to the original.
 """
 import asyncio
+import io
 import re
 import sys
 import time
@@ -20,6 +21,7 @@ from playwright.async_api import Error as BrowserError, async_playwright
 
 WAIT = 110      # seconds to wait for a page - slow errors like Cloudflare 522 (~20s) still get captured
 PARALLEL = 20   # pages open at the same time
+CHECK_LIMIT = 600  # seconds - a site that somehow takes longer than this is marked failed, so a run always finishes
 CLOUDFLARE = {520: "Web server is returning an unknown error", 521: "Web server is down",
               522: "Connection timed out", 523: "Origin is unreachable", 524: "A timeout occurred",
               525: "SSL handshake failed", 526: "Invalid SSL certificate"}
@@ -70,6 +72,72 @@ def describe(code, title, html, final_url, host):
     return result
 
 
+async def close_quietly(tab_or_window):
+    """Close a tab or window. Chrome sometimes never answers when a page is redirecting at that moment -
+    give up after 10s instead of freezing the whole run (the result is already known by then)."""
+    try:
+        await asyncio.wait_for(tab_or_window.close(), 10)
+    except (asyncio.TimeoutError, BrowserError):
+        pass
+
+
+def address(url):
+    """'host/path' of a URL, as shown in results, e.g. 'login.example.com/sso'."""
+    u = urlparse(url)
+    return f"{u.hostname}{'' if u.path in ('', '/') else u.path}"
+
+
+class Moving(Exception):
+    """The page is on its way to another address (a script or meta-refresh redirect, or a Cloudflare check
+    reloading the page) and hasn't got there yet."""
+
+
+async def read_now(page, read):
+    """page.title / page.content right now. Raises Moving if the page is on its way somewhere else - reading
+    then either fails ("page is navigating") or waits until that address answers, which may be never."""
+    try:
+        return await asyncio.wait_for(read(), 10)
+    except asyncio.TimeoutError:
+        raise Moving from None
+    except BrowserError as e:
+        if "navigat" in str(e):  # "...page is navigating..." / "...because of a navigation"
+            raise Moving from None
+        raise
+
+
+async def on_challenge(page):
+    """Is the page Cloudflare's "Just a moment..." check? None if it's on its way somewhere else."""
+    try:
+        return (await read_now(page, page.title)).lower().startswith("just a moment")
+    except Moving:
+        return None
+
+
+async def where_it_lands(page, navigations):
+    """Title and HTML of the page a visitor ends up on. If the page has moved on to another address, wait for
+    that to load first - up to WAIT seconds, like a visitor. Returns (title, html, None), or (None, None, problem)
+    if that address failed or never answered, e.g. 'No data received (ERR_EMPTY_RESPONSE) (at login.example.com)'."""
+    deadline = time.monotonic() + WAIT
+    while True:
+        try:
+            title, html = await read_now(page, page.title), await read_now(page, page.content)
+            break
+        except Moving:
+            if time.monotonic() > deadline:
+                target = address(navigations[-1].url) if navigations else address(page.url)
+                return None, None, f"{explain('ERR_TIMED_OUT')} (at {target})"
+            await asyncio.sleep(0.5)
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=10000)
+            except BrowserError:
+                pass
+    if page.url.startswith("chrome-error://"):  # it moved on to an address that failed - Chrome shows its error page
+        failed = next((r for r in reversed(navigations) if r.failure), None)
+        code = re.search(r"ERR_[A-Z_]+", (failed and failed.failure) or "")
+        return None, None, f"{explain(code.group(0) if code else 'ERR_FAILED')} (at {address(failed.url if failed else page.url)})"
+    return title, html, None
+
+
 async def visit(window, url, host):
     """Open url; if the connection drops, try again like a visitor pressing reload (up to 3 tries)."""
     for _ in range(3):
@@ -86,18 +154,25 @@ async def open_page(window, url, host):
     pages = []
     page.on("response", lambda r: pages.append(r)
             if r.request.is_navigation_request() and r.frame == page.main_frame else None)
+    navigations = []  # every address the tab sets off for, answered or not
+    page.on("request", lambda r: navigations.append(r)
+            if r.is_navigation_request() and r.frame == page.main_frame else None)
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=WAIT * 1000)
         try:
             await page.wait_for_load_state("networkidle", timeout=8000)  # let redirects and scripts finish
         except BrowserError:
             pass
-        for _ in range(20):  # let a Cloudflare "checking your browser" page clear, as it would for a visitor
-            if not (await page.title()).lower().startswith("just a moment"):
-                break
-            await page.wait_for_timeout(1000)
+        if await on_challenge(page):  # a Cloudflare "checking your browser" page - let it clear, as it would for a visitor
+            for _ in range(20):
+                await page.wait_for_timeout(1000)
+                if await on_challenge(page) is False:
+                    break
+        title, html, problem = await where_it_lands(page, navigations)
+        if problem:  # the page sent visitors on to an address that failed or never answered
+            return problem, None
         code = pages[-1].status if pages else 0
-        return describe(code, await page.title(), await page.content(), page.url, host), None
+        return describe(code, title, html, page.url, host), None
     except BrowserError as e:
         found = re.search(r"net::(ERR_[A-Z_]+)", str(e))
         error = found.group(1) if found else "ERR_TIMED_OUT" if "Timeout" in str(e) else type(e).__name__
@@ -105,7 +180,7 @@ async def open_page(window, url, host):
             return describe(pages[-1].status, "", "", pages[-1].url, host), None
         return None, error
     finally:
-        await page.close()
+        await close_quietly(page)
 
 
 async def check(browser, host):
@@ -122,7 +197,7 @@ async def check(browser, host):
             try:
                 behind, error2 = await visit(unsafe, url, name)
             finally:
-                await unsafe.close()
+                await close_quietly(unsafe)
             warning = CERT_WARNINGS.get(error, f"certificate problem ({error})")
             return f"SSL error - {warning}; behind the warning: {behind or explain(error2)}"
         if (error != "ERR_NAME_NOT_RESOLVED" and url.startswith("https://")
@@ -132,7 +207,7 @@ async def check(browser, host):
                 return f"{explain(error)}; over HTTP: {over_http}"
         return explain(error)
     finally:
-        await window.close()
+        await close_quietly(window)
 
 
 async def launch(playwright):
@@ -153,20 +228,57 @@ async def check_all(hosts):
         user_agent = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
                       f"Chrome/{browser.version.split('.')[0]}.0.0.0 Safari/537.36")
         limit = asyncio.Semaphore(PARALLEL)
+        restarting = asyncio.Lock()
+
+        async def running_browser():
+            nonlocal browser
+            async with restarting:
+                if not browser.is_connected():  # Chrome crashed or was closed (e.g. short of memory) - start it again
+                    browser = await launch(p)
+            return browser
 
         async def one(host):
             nonlocal done
             async with limit:
-                try:
-                    results[host] = await check(browser, host)
-                except Exception as e:  # never let one URL stop the run
-                    results[host] = f"Failed - {type(e).__name__}"
+                for attempt in (1, 2):
+                    current = await running_browser()
+                    try:
+                        results[host] = await asyncio.wait_for(check(current, host), CHECK_LIMIT)
+                    except asyncio.TimeoutError:
+                        results[host] = f"Failed - no result after {CHECK_LIMIT // 60} minutes"
+                    except Exception as e:  # never let one URL stop the run
+                        results[host] = f"Failed - {type(e).__name__}"
+                    if current.is_connected():
+                        break
+                    # Chrome went away mid-check, so that result can't be trusted - check again in a fresh one
             done += 1
             print(f"[{done}/{len(hosts)}] {host:<50} {results[host]}", flush=True)
 
         await asyncio.gather(*(one(h) for h in hosts))
-        await browser.close()
+        await close_quietly(browser)
     return results
+
+
+def read_bytes(path):
+    """Read a file even while it is open in Excel. Excel locks OneDrive files so that normal reading fails
+    ("Permission denied"), but it still lets a program read them if that program also allows the file to be
+    renamed or deleted while it reads (FILE_SHARE_DELETE)."""
+    if sys.platform != "win32":
+        return Path(path).read_bytes()
+    import ctypes
+    import msvcrt
+    import os
+    from ctypes import wintypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                     wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+    # GENERIC_READ, share read + write + delete, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL
+    handle = kernel32.CreateFileW(str(path), 0x80000000, 0x7, None, 3, 0x80, None)
+    if handle in (None, wintypes.HANDLE(-1).value):
+        raise ctypes.WinError(ctypes.get_last_error())
+    with open(msvcrt.open_osfhandle(handle, os.O_RDONLY), "rb") as f:  # closes the handle too
+        return f.read()
 
 
 BLANK_PROPERTIES = {  # empty document properties: no author, dates, app or company details
@@ -196,10 +308,10 @@ def strip_metadata(path):
 def main():
     path = Path(sys.argv[1] if len(sys.argv) > 1 else input("Drag your file here and press Enter: ").strip('" '))
     if path.suffix.lower() in (".xlsx", ".xlsm"):
-        wb = load_workbook(path)
+        wb = load_workbook(io.BytesIO(read_bytes(path)))
     else:  # .csv / .txt - one URL per line
         wb = Workbook()
-        for line in path.read_text(encoding="utf-8-sig").splitlines():
+        for line in read_bytes(path).decode("utf-8-sig").splitlines():
             wb.active.append([line.split(",")[0].strip()])
     ws = wb.worksheets[0]
 
